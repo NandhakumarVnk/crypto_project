@@ -1,0 +1,49 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/.pytest_cache/
+
+# Frontend / Node
+node_modules/
+dist/
+**/node_modules/
+**/dist/
+.next/
+out/
+
+# Local databases and uploaded files
+*.db
+*.sqlite3
+*.sqlite
+uploads/
+storage/
+**/uploads/
+**/storage/
+coverage/
+**/coverage/
+
+# Private cryptographic keys
+*.pem
+*.key
+private_keys/
+**/private_keys/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

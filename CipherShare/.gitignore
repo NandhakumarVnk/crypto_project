@@ -1,0 +1,34 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
+
+# Local databases and uploaded files
+*.db
+*.sqlite3
+uploads/
+storage/
+*.sqlite
+coverage/
+# Private cryptographic keys
+*.pem
+*.key
+private_keys/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
