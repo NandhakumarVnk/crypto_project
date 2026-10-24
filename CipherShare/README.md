@@ -162,6 +162,164 @@ Tests use an isolated in-memory SQLite database and never modify the developer's
 
 ---
 
+## Cryptographic Design: Encryption & Decryption Process
+
+CipherShare employs an **Adaptive Hybrid Cryptography Architecture** combining authenticated symmetric bulk data encryption (for high throughput and tamper detection) with asymmetric key encapsulation (for zero-trust key exchange) and dual-layer integrity verification.
+
+```
+===================================================================================================
+                                  ENCRYPTION & DECRYPTION PIPELINE
+===================================================================================================
+
+[ SENDER ]                                                                           [ RECEIVER ]
+    |                                                                                     |
+    | 1. Select file & sensitivity                                                        |
+    v                                                                                     |
++------------------------------+                                                          |
+| Adaptive Policy Engine       |                                                          |
+| - Evaluates file size & type |                                                          |
+| - Checks threat telemetry    |                                                          |
+| - Assigns Cipher, TTL, Quota |                                                          |
++--------------+---------------+                                                          |
+               |                                                                          |
+               | 2. Pre-hash: SHA256(Plaintext)                                           |
+               v                                                                          |
++------------------------------+                                                          |
+| SHA-256 Digest Engine        |                                                          |
++--------------+---------------+                                                          |
+               |                                                                          |
+               | 3. CSPRNG Session Key Gen                                                |
+               v                                                                          |
++------------------------------+                                                          |
+| Symmetric Session Key (Ks)   |                                                          |
+| (AES-256 / AES-128 / ChaCha) |                                                          |
++-------+--------------+-------+                                                          |
+        |              |                                                                  |
+        | (Data)       | (Key Encapsulation)                                              |
+        v              v                                                                  |
++---------------+ +----------------------------+                                          |
+| AEAD Cipher   | | RSA-OAEP Encapsulation     |                                          |
+| Encrypts file | | Encrypts Ks using          |                                          |
+| with IV/Nonce | | Receiver's RSA Public Key  |                                          |
++-------+-------+ +-------------+--------------+                                          |
+        |                       |                                                         |
+        | Ciphertext + Tag      | Encrypted Key (C_key)                                   |
+        v                       v                                                         |
++----------------------------------------------+                                          |
+|           STORAGE & DATABASE (At Rest)       |                                          |
+|  - Encrypted payload stored on disk          |                                          |
+|  - Zero plaintext retained anywhere          |                                          |
++----------------------------------------------+                                          |
+                                |                                                         |
+                                | <------------------ 1. Request Download & Decrypt ------+
+                                v                                                         |
++----------------------------------------------+                                          |
+| Zero-Trust Key Lifecycle Verification        |                                          |
+| - Validates JWT & Receiver identity          |                                          |
+| - Enforces Key Status == ACTIVE              |                                          |
+| - Checks TTL Expiration & Max Download Quota |                                          |
++-----------------------+----------------------+                                          |
+                        |                                                                 |
+                        | 2. Key Decapsulation                                            |
+                        v                                                                 |
++----------------------------------------------+                                          |
+| RSA-OAEP Decryption                          |                                          |
+| - Unwraps Ks using Receiver's RSA Private Key|                                          |
++-----------------------+----------------------+                                          |
+                        |                                                                 |
+                        | 3. Authenticated Decryption                                     |
+                        v                                                                 |
++----------------------------------------------+                                          |
+| AEAD Decryptor (AES-GCM / ChaCha20-Poly1305) |                                          |
+| [Layer 1 Defense] Verifies Auth Tag:         |                                          |
+|  * Match -> Proceed to Layer 2               |                                          |
+|  * Mismatch/Tamper -> Instant Invalidation & |                                          |
+|    raises Security Alert (HTTP 400)          |                                          |
++-----------------------+----------------------+                                          |
+                        |                                                                 |
+                        | 4. End-to-End Integrity Verification                            |
+                        v                                                                 |
++----------------------------------------------+                                          |
+| Constant-Time SHA-256 Digest Verification    |                                          |
+| [Layer 2 Defense] compare_digest(H_dec, H_orig)|                                        |
+|  * Valid -> Deliver Plaintext File           | ---------------- Plaintext File -------->+
+|  * Corrupted -> Quarantine & Invalidate Key  |                                          |
++----------------------------------------------+                                          |
+```
+
+---
+
+### Step-by-Step Encryption Flow
+
+1. **File Characterization & Adaptive Policy Assignment**
+   - The sender submits the file alongside an optional sensitivity rating (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
+   - The **Adaptive Security Policy Engine** analyzes:
+     - **Payload size & characteristics**: Chooses between AES-128-GCM (optimized latency for high-volume non-sensitive files), AES-256-GCM (military-grade defense for critical assets), or ChaCha20-Poly1305 (lightweight mobile and stream efficiency).
+     - **Historical Telemetry**: Checks the sender's recent incident rate. If anomalous activity is detected, validity TTL is curtailed by 50% and quotas are tightened.
+     - **Lifecycle Attributes**: Dynamically sets a Time-to-Live (TTL: 10 minutes to 24 hours), single-use or multi-use download quota, and key rotation thresholds.
+
+2. **Pre-Encryption Integrity Hashing (`SHA-256`)**
+   - Before applying any transformation, the raw plaintext bytes are hashed using **SHA-256**:
+     $$\text{Digest}_{\text{original}} = \text{SHA-256}(\text{Plaintext})$$
+   - This baseline digest is retained securely in the database to guarantee end-to-end provenance verification after decryption.
+
+3. **Symmetric Session Key Generation**
+   - A fresh, high-entropy cryptographic session key ($K_s$) is generated using the operating system's Cryptographically Secure Pseudorandom Number Generator (CSPRNG via `secrets.token_bytes` / `os.urandom`):
+     - **AES-128 / AES-256**: 16 bytes or 32 bytes.
+     - **ChaCha20-Poly1305**: 32 bytes.
+
+4. **Authenticated Symmetric Encryption (`AEAD`)**
+   - The file is encrypted using Authenticated Encryption with Associated Data (AEAD) with a random, single-use 96-bit (12-byte) initialization vector/nonce:
+     $$(\text{Ciphertext}, \text{AuthTag}) = \text{Encrypt}_{K_s}(\text{Plaintext}, \text{Nonce})$$
+   - The 128-bit authentication tag guarantees that the ciphertext cannot be altered or reordered without detection.
+
+5. **Asymmetric Key Encapsulation (`RSA-OAEP`)**
+   - The symmetric session key $K_s$ is encapsulated using the **recipient's public RSA key** (RSA-2048 or RSA-4096) utilizing **OAEP (Optimal Asymmetric Encryption Padding)** with a SHA-256 hash and MGF1 masking:
+     $$\text{EncryptedSessionKey} = \text{RSA-OAEP-Encrypt}(K_s, \text{PublicKey}_{\text{receiver}})$$
+   - This ensures forward secrecy: only the holder of the recipient's private key can decapsulate $K_s$.
+
+6. **Encrypted Storage & Persistence**
+   - The `Ciphertext` is written to an isolated storage directory (`uploads/<uuid>.enc`). No plaintext touches permanent disk.
+   - The database records the transfer metadata, the `EncryptedSessionKey`, `Nonce`, `AuthTag`, pre-calculated `original_sha256`, and initial `ACTIVE` lifecycle status.
+
+---
+
+### Step-by-Step Decryption Flow
+
+1. **Access Control & Lifecycle Gatekeeping**
+   - The recipient authenticates via JWT bearer token.
+   - The system verifies that the caller matches `receiver_id` (or authorized auditor). Unauthorized requests immediately generate an `UNAUTHORIZED_ACCESS` audit event.
+   - The **Key Lifecycle Manager** validates:
+     - **Status**: Key must be `ACTIVE`. If marked `EXPIRED`, `ROTATED`, or `INVALIDATED`, decryption is refused.
+     - **Temporal TTL**: If `current_time > expires_at`, the key status is automatically flipped to `EXPIRED` and logged as `EXPIRED_KEY_ATTEMPT`.
+     - **Quota**: If `download_count >= max_downloads`, access is rejected and the key is invalidated.
+
+2. **Session Key Decapsulation (`RSA-OAEP`)**
+   - The receiver's private key is used to decapsulate the symmetric session key:
+     $$K_s = \text{RSA-OAEP-Decrypt}(\text{EncryptedSessionKey}, \text{PrivateKey}_{\text{receiver}})$$
+
+3. **Authenticated Decryption & AEAD Tag Verification (Layer 1 Defense)**
+   - The encrypted bytes are read from disk storage along with the stored `Nonce` and `AuthTag`.
+   - The AEAD cipher attempts decryption:
+     $$\text{Plaintext} = \text{Decrypt}_{K_s}(\text{Ciphertext}, \text{Nonce}, \text{AuthTag})$$
+   - **Tamper Interception**: If any bit of the ciphertext, nonce, or tag was modified in transit or at rest, the underlying cryptographic library throws `InvalidTag`. The system immediately:
+     1. Flags the transfer as `COMPROMISED`.
+     2. Transitions the session key to `INVALIDATED`.
+     3. Emits a forensic `INTEGRITY_FAILURE` security event.
+     4. Halts execution and returns `400 Bad Request` without exposing partial plaintext.
+
+4. **End-to-End SHA-256 Digest Verification (Layer 2 Defense)**
+   - The recovered plaintext is independently re-hashed:
+     $$\text{Digest}_{\text{actual}} = \text{SHA-256}(\text{Plaintext})$$
+   - Verified against the sender's stored `original_sha256` using **constant-time string comparison** (`hmac.compare_digest`) to prevent timing side-channel attacks.
+   - If the hashes match, an `INTEGRITY_VERIFIED` event is logged and the validated file is streamed to the receiver.
+
+5. **Key Lifecycle & Quota Update**
+   - The transfer's `download_count` is incremented.
+   - If the single-use quota or policy limit is satisfied, the key is permanently transitioned to `INVALIDATED` to prevent replay or future leakage.
+
+---
+
 ## API Endpoints
 
 ### Health Check
